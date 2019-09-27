@@ -63,8 +63,9 @@ class ReflexCaptureAgent(CaptureAgent):
         self.lastAction = None
         self.targetPos = None
         self.mazeSize = None
-        self.boarder = None
+        self.border = None
         self.initialFoodList = None
+        self.specificPath = []
  
     def registerInitialState(self, gameState):
         self.start = gameState.getAgentPosition(self.index)
@@ -80,7 +81,7 @@ class ReflexCaptureAgent(CaptureAgent):
         for y in range(1, walls.height - 1):
             if not walls[x][y] and (x, y) != self.start:
                 boader.append((x, y))
-        self.boarder = boader
+        self.border = boader
         
     def getSuccessor(self, gameState, action):
         """
@@ -164,13 +165,13 @@ class ReflexCaptureAgent(CaptureAgent):
             successor = self.getSuccessor(gameState, action)
             myNextPos = successor.getAgentPosition(self.index)
 
-            finalNode = self.aStarSearch(successor, self.boarder, [myPos])
+            finalNode = self.aStarSearch(successor, self.border, [myPos])
             if finalNode[2] < self.mazeSize:
                 safeActions.append(action)
 
         return safeActions
 
-    def getAlternativePath(self, gameState, minPathLength=5, penaltyDist=3, exploreRange=5):
+    def getAlternativePath(self, gameState, minPathLength=5, penaltyDist=2, exploreRange=5):
         walls = gameState.getWalls()
         myPos = gameState.getAgentPosition(self.index)
         ghosts = self.getGhosts(gameState)
@@ -192,13 +193,13 @@ class ReflexCaptureAgent(CaptureAgent):
                         targetList.remove(pos)
 
         if len(targetList) == 0:
-            return []
+            return [], None
 
         finalNode = self.aStarSearch(gameState, targetList, penaltyPos)
         pathLength = min(minPathLength, len(finalNode[1]))
         return finalNode[1][0:pathLength], finalNode[0]
                         
-    def aStarSearch(self, gameState, goals, penaltyPos=[], avoidGhose=False):
+    def aStarSearch(self, gameState, goals, penaltyPos=[], avoidGhost=False):
         walls = gameState.getWalls().asList()
         ghosts = self.getGhosts(gameState)
         actions = [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]
@@ -227,14 +228,25 @@ class ReflexCaptureAgent(CaptureAgent):
                     if successor[0] in penaltyPos:
                         cost += self.mazeSize
 
-                    if avoidGhose:
-                        cost += min([self.getMazeDistance(successor[0], a.getPosition()) for a in ghosts]) / self.mazeSize
+                    if avoidGhost:
+                        distToGhost = min([self.getMazeDistance(successor[0], a.getPosition()) for a in ghosts])
+                        if distToGhost > 0:
+                            cost += (self.mazeSize / 4) / distToGhost
 
                     pQueue.push((position, path, cost))
 
         return currentNode
+    
+    def isOppoentsScared(self, gameState, timer=3):
+        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
 
-    def isStucking(self, gameState, stuckingCount=3):
+        for a in enemies:
+            if not a.isPacman and a.scaredTimer <= timer:
+                return False
+
+        return True
+
+    def isStucking(self, gameState, stuckingCount=4):
         history = self.observationHistory
         count = 0
         myPos = gameState.getAgentPosition(self.index)
@@ -247,7 +259,7 @@ class ReflexCaptureAgent(CaptureAgent):
             
         return count >= stuckingCount
 
-    def isChased(self, gameState, chasedCount=4):
+    def isChased(self, gameState, chasedCount=2):
         history = self.observationHistory
         myState = gameState.getAgentState(self.index)
         ghosts = self.getGhosts(gameState)
@@ -284,15 +296,14 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         ReflexCaptureAgent.__init__(self, index, **args)
         self.weights = util.Counter({
             'bias': 1.0,
-            'distToTarget': -1.0,
-            'distToGhost': 1.0,
-            'distToCapsule': -1.5,
+            'distToTarget': -10.0,
+            'distToGhost': 5.0,
+            'distToBorder': -1.0,
             'eatFood': 1.0,
-            '#-of-ghosts-1step-away': -1.0,
-            'stop': -1.0,
+            '#-of-ghosts-2-step-away': -1,
         })
         self.numFoodCarrying = 0
-        self.specificPath = []
+        self.wasAlternative = False
 
     def registerInitialState(self, gameState):
         ReflexCaptureAgent.registerInitialState(self, gameState)
@@ -300,69 +311,88 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         myPos = gameState.getAgentPosition(self.index)
         foodList = self.getFood(gameState).asList()
         if len(foodList) > 0:
-            self.targetPos = max(foodList, key=lambda food: self.getMazeDistance(myPos, food))
+            self.targetPos = max(foodList, key=lambda x: self.getMazeDistance(myPos, x))
 
     def updateTarget(self, gameState):
         myState = gameState.getAgentState(self.index)
         myPos = myState.getPosition()
-        distFromPrevPos = self.getMazeDistance(gameState.getAgentPosition(self.index), self.lastState.getAgentPosition(self.index))
+        myLastState = self.lastState.getAgentState(self.index)
         foodList = self.getFood(gameState).asList()
         lastFoodList = self.getFood(self.lastState).asList()
+        capsuleList = self.getCapsules(gameState)
         ghosts = self.getGhosts(gameState)
-        distToBoarder = min([self.getMazeDistance(myPos, b) for b in self.boarder])
+        closestBorder = min(self.border, key=lambda x: self.getMazeDistance(myPos, x))
+        minDistToBorder = min([self.getMazeDistance(myPos, b) for b in self.border])
 
-        if len(lastFoodList) > len(foodList):
-            print("EAT FOOD")
-            self.numFoodCarrying += 1
-            
-        if distFromPrevPos > 1:
+        if myPos == self.start:
             self.numFoodCarrying = 0
             self.specificPath = []
-            
             if len(foodList) > 0:
-                if len(foodList) < len(self.initialFoodList) * 2 / 3:
-                    self.targetPos = min(foodList, key=lambda food: self.getMazeDistance(myPos, food))
-                else:
-                    self.targetPos = self.aStarSearch(gameState, foodList, [], True)[0]
-                print("UPDATE 1")
+                self.targetPos = min(foodList, key=lambda x: self.getMazeDistance(myPos, x))
+            print("RETURN TO START")
 
-        if not gameState.getAgentState(self.index).isPacman and self.lastState.getAgentState(self.index).isPacman:
+        if len(lastFoodList) > len(foodList):
+            self.numFoodCarrying += 1
+            print("EAT FOOD")
+
+        if not myState.isPacman:
             self.numFoodCarrying = 0
-            self.targetPos = max(foodList, key=lambda food: self.getMazeDistance(myPos, food))
-            print("UPDATE 2")
 
-        if self.numFoodCarrying > 3 and not self.isScared(gameState):
-            self.targetPos = min(self.boarder, key=lambda x: self.getMazeDistance(myPos, x))
-            print("UPDATE 3")
+        timeLeft = gameState.data.timeleft / gameState.getNumAgents()
+        if timeLeft - minDistToBorder <= 4:
+            self.targetPos = closestBorder
+            print("TIMER UPDATE")
 
-        if len(foodList) > 0:
-            nextFoodPos = self.aStarSearch(gameState, foodList, [], True)[0]
-            distToNextFood = self.getMazeDistance(myPos, nextFoodPos)
-            if self.numFoodCarrying > 0 and distToBoarder < distToNextFood and not self.isScared(gameState):
-                self.targetPos = min(self.boarder, key=lambda x: self.getMazeDistance(myPos, x))
-                print("UPDATE 4")
-
-            if myPos in lastFoodList:
-                self.targetPos = nextFoodPos
-                print("UPDATE 5")
-        
         if len(foodList) == 0:
-            self.targetPos = min(self.boarder, key=lambda x: self.getMazeDistance(myPos, x))
-            print("UPDATE 6")
+            self.targetPos = closestBorder
+            print("UPDATE 1")
 
-        distToGhost = min([self.getMazeDistance(myPos, a.getPosition()) for a in ghosts])
-        if not self.isScared(gameState) and myState.isPacman and distToGhost <= 5 and self.numFoodCarrying > 0 and not self.isScared(gameState):
-            self.targetPos = min(self.boarder, key=lambda x: self.getMazeDistance(myPos, x))
-            print("UPDATE 7")
+        if len(foodList) > 0 and len(ghosts) == 0:
+                if myPos == self.targetPos or myPos in lastFoodList:
+                    self.targetPos = min(foodList, key=lambda x: self.getMazeDistance(myPos, x))
+                    print("UPDATE 2")
+            
+        if len(ghosts) > 0:
+            minDistToFood =  min([self.getMazeDistance(myPos, f) for f in foodList])
+            minDistToGhost =  min([self.getMazeDistance(myPos, a.getPosition()) for a in ghosts])
 
-        if self.isChased(gameState) and not self.isScared(gameState):
-            self.targetPos = min(self.boarder, key=lambda x: self.getMazeDistance(myPos, x))
-            print("UPDATE 8")
+            if len(foodList) > 0:
+                if myPos == self.targetPos or myPos in lastFoodList and self.numFoodCarrying == 0:
+                    if minDistToGhost <= 3 and not self.isOppoentsScared(gameState):
+                        path, target = self.getAlternativePath(gameState, minPathLength=6)
+                        self.specificPath = path
+                        self.targetPos = target
+                        print("UPDATE 3")
+                    else:
+                        self.targetPos = min(foodList, key=lambda x: self.getMazeDistance(myPos, x))
+                        print("UPDATE 4")
+                elif not myState.isPacman and myLastState.isPacman and minDistToGhost <= 3:
+                    path, target = self.getAlternativePath(gameState, minPathLength=6)
+                    self.specificPath = path
+                    self.targetPos = target
+                    print("UPDATE 5")
 
-        if not myState.isPacman and distToGhost <= 4 and len(self.specificPath) == 0:
-            self.specificPath = self.getAlternativePath(gameState, minPathLength=5, penaltyDist=5)[0]
-            print("UPDATE 9")
+            if not self.isOppoentsScared(gameState) and self.isChased(gameState):
+                self.targetPos = closestBorder
+                print("UPDATE 6")
 
+            if  self.numFoodCarrying >= 3 and not self.isOppoentsScared(gameState) and minDistToBorder < minDistToFood:
+                self.targetPos = closestBorder
+                print("UPDATE 7")
+                    
+            if self.numFoodCarrying >= 5 and not self.isOppoentsScared(gameState) and minDistToGhost <= 5:
+                self.targetPos = closestBorder
+                print("UPDATE 8")
+            
+            if len(capsuleList) > 0:
+                minDistToCapsule =  min([self.getMazeDistance(myPos, c) for c in capsuleList])
+                
+                if not self.isOppoentsScared(gameState) and self.isChased(gameState) and minDistToCapsule < minDistToBorder:
+                    self.targetPos = min(capsuleList, key=lambda x: self.getMazeDistance(myPos, x))
+                    print("UPDATE 9")
+
+        print("TARGET", self.targetPos)
+        
     def observationFunction(self, gameState):
         """
         This is where we ended up after our last action.
@@ -375,8 +405,8 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         return gameState
 
     def getFeatures(self, gameState, action):
-        myCurrState = gameState.getAgentState(self.index)
-        myCurrPos = myCurrState.getPosition()
+        myState = gameState.getAgentState(self.index)
+        myPos = myState.getPosition()
         
         successor = self.getSuccessor(gameState, action)
         myNextState = successor.getAgentState(self.index)
@@ -387,33 +417,33 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
 
         if len(ghosts) > 0:
             distToGhost = min([self.getMazeDistance(myNextPos, a.getPosition()) for a in ghosts])
-            if self.isScared(successor) and myNextState.isPacman:
-                if distToGhost > 2:
+            if not self.isOppoentsScared and distToGhost <= 1:
+                distToGhost = -999999
+            if self.isOppoentsScared(successor) and myNextState.isPacman:
+                if distToGhost > 0:
                     distToGhost *= 0.8
                 else:
-                    distToGhost *= -float('inf')
+                    distToGhost = 999999
 
         capsuleList = self.getCapsules(gameState)
         distToCapsule = 0.0
         if len(capsuleList) > 0:
             distToCapsule = min([self.getMazeDistance(myNextPos, capsule) for capsule in capsuleList])
-
-        ghosts1StepAway = len([ghost for ghost in ghosts if self.getMazeDistance(myNextPos, ghost.getPosition()) <= 1])
-        
-        eatFood = 0
-        foodList = self.getFood(gameState).asList()
-        if myNextPos in foodList:
-            eatFood = 1.0 
         
         features = util.Counter()
         features['bias'] = 1.0
         features['distToTarget'] = self.getMazeDistance(myNextPos, self.targetPos) / self.mazeSize
         features['distToGhost'] = distToGhost / self.mazeSize
         features['distToCapsule'] = distToCapsule / self.mazeSize
-        features['#-of-ghosts-1step-away'] = ghosts1StepAway / 2.0
-        features['eatFood'] = eatFood
-
-        if action == Directions.STOP: features['stop'] = 1
+        
+        features['#-of-ghosts-2-step-away'] = len([ghost for ghost in ghosts if self.getMazeDistance(myNextPos, ghost.getPosition()) <= 2])
+        
+        foodList = self.getFood(gameState).asList()
+        if not features['#-of-ghosts-2-step-away'] and myNextPos in foodList:
+            features['eatFood'] = 1.0
+        
+        if self.numFoodCarrying > 0: 
+            features['distToBorder'] = min([self.getMazeDistance(myPos, b) for b in self.border]) / (self.mazeSize / 4)
         
         return features
 
@@ -423,23 +453,28 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
         """
         myState = gameState.getAgentState(self.index)
         myPos = myState.getPosition()
-        actions = gameState.getLegalActions(self.index)
 
         ghosts = self.getGhosts(gameState)
+        
         if len(self.specificPath) > 0:
             return self.specificPath.pop(0)
         elif self.isStucking(gameState):
-            actions, target = self.getAlternativePath(gameState)
+            print("IS STUCKING")
+            actions, target = self.getAlternativePath(gameState, minPathLength=3)
             if len(actions) > 0:
                 self.specificPath = actions
                 self.targetPos = target
                 return self.specificPath.pop(0)
             else:
+                actions = gameState.getLegalActions(self.index)
                 return random.choice(actions)
-        
+                
+        actions = gameState.getLegalActions(self.index)
+        actions.remove('Stop')
+
         if len(ghosts) > 0:
             distToGhost = min([self.getMazeDistance(myPos, a.getPosition()) for a in ghosts])
-            if not self.isScared(gameState) and myState.isPacman and distToGhost <= 5:
+            if not self.isOppoentsScared(gameState) and myState.isPacman and distToGhost <= 6:
                 safeActions = self.getSafeActions(gameState)
                 if len(safeActions) > 0:
                     actions = safeActions
@@ -478,15 +513,6 @@ class OffensiveReflexAgent(ReflexCaptureAgent):
 
         return reward
 
-    def isScared(self, gameState):
-        enemies = [gameState.getAgentState(i) for i in self.getOpponents(gameState)]
-
-        for e in enemies:
-            if not e.isPacman and e.scaredTimer > 3:
-                return True
-
-        return False
-
 
 class DefensiveReflexAgent(ReflexCaptureAgent):
     """
@@ -502,7 +528,7 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
             'distToTarget': -1.0,
             'distToInvader': -1.0,
             'numOfInvaders': -1.0,
-            'isScared': 1.0,
+            'isOppoentsScared(gameState)': 1.0,
             'onDefense': 10.0,
             'stop': -1.0,
         })
@@ -511,7 +537,7 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         ReflexCaptureAgent.registerInitialState(self, gameState)
         
         distCounter = util.Counter()
-        for b in self.boarder:
+        for b in self.border:
             dist = 0
             for food in self.getFoodYouAreDefending(gameState).asList():
                 dist = self.getMazeDistance(b, food)
@@ -539,9 +565,9 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
         features['distToTarget'] = self.getMazeDistance(myNextPos, self.targetPos) / self.mazeSize
         
         if myNextState.scaredTimer > 0:
-            features['isScared'] = (distToInvader - myNextState.scaredTimer) / self.mazeSize
+            features['isOppoentsScared'] = (distToInvader - myNextState.scaredTimer) / self.mazeSize
         else:         
-            features['isScared'] = 0.0
+            features['isOppoentsScared'] = 0.0
 
         if not myNextState.isPacman: features['onDefense'] = 1.0
 
@@ -588,7 +614,7 @@ class DefensiveReflexAgent(ReflexCaptureAgent):
 
         if len(invaders) == 0:
             distCounter = util.Counter()
-            for b in self.boarder:
+            for b in self.border:
                 dist = 0
                 for food in self.getFoodYouAreDefending(gameState).asList():
                     dist = self.getMazeDistance(b, food)
